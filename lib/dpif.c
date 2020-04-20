@@ -757,10 +757,10 @@ dpif_port_query_by_name(const struct dpif *dpif, const char *devname,
  * update all of the flows that it installed that contain
  * OVS_ACTION_ATTR_USERSPACE actions. */
 uint32_t
-dpif_port_get_pid(const struct dpif *dpif, odp_port_t port_no)
+dpif_port_get_pid(const struct dpif *dpif, odp_port_t port_no, uint32_t hash)
 {
     return (dpif->dpif_class->port_get_pid
-            ? (dpif->dpif_class->port_get_pid)(dpif, port_no)
+            ? (dpif->dpif_class->port_get_pid)(dpif, port_no, hash)
             : 0);
 }
 
@@ -1358,6 +1358,8 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops,
              * handle itself, without help. */
             size_t i;
 
+            // JIHO: call dpif_netlink_operate()
+            // call dpif_netlink_operate__
             dpif->dpif_class->operate(dpif, ops, chunk, offload_type);
 
             for (i = 0; i < chunk; i++) {
@@ -1369,7 +1371,9 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops,
                     struct dpif_flow_put *put = &op->flow_put;
 
                     COVERAGE_INC(dpif_flow_put);
+                    // JIHO
                     log_flow_put_message(dpif, &this_module, put, error);
+                    //log_flow_put_message1(dpif, &this_module, put, error);
                     if (error && put->stats) {
                         memset(put->stats, 0, sizeof *put->stats);
                     }
@@ -1756,6 +1760,42 @@ log_flow_message(const struct dpif *dpif, int error,
 }
 
 void
+log_flow_message1(const struct dpif *dpif, int error,
+                 const struct vlog_module *module,
+                 const char *operation,
+                 const struct nlattr *key, size_t key_len,
+                 const struct nlattr *mask, size_t mask_len,
+                 const ovs_u128 *ufid, const struct dpif_flow_stats *stats,
+                 const struct nlattr *actions, size_t actions_len)
+{
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    ds_put_format(&ds, "%s: ", dpif_name(dpif));
+    if (error) {
+        ds_put_cstr(&ds, "failed to ");
+    }
+    ds_put_format(&ds, "%s ", operation);
+    if (error) {
+        ds_put_format(&ds, "(%s) ", ovs_strerror(error));
+    }
+    if (ufid) {
+        odp_format_ufid(ufid, &ds);
+        ds_put_cstr(&ds, " ");
+    }
+    odp_flow_format(key, key_len, mask, mask_len, NULL, &ds, true);
+    if (stats) {
+        ds_put_cstr(&ds, ", ");
+        dpif_flow_stats_format(stats, &ds);
+    }
+    if (actions || actions_len) {
+        ds_put_cstr(&ds, ", actions:");
+        format_odp_actions(&ds, actions, actions_len, NULL);
+    }
+
+    vlog(module, VLL_WARN, "%s", ds_cstr(&ds));
+    ds_destroy(&ds);
+}
+
+void
 log_flow_put_message(const struct dpif *dpif,
                      const struct vlog_module *module,
                      const struct dpif_flow_put *put,
@@ -1782,6 +1822,33 @@ log_flow_put_message(const struct dpif *dpif,
                          put->actions_len);
         ds_destroy(&s);
     }
+}
+
+void
+log_flow_put_message1(const struct dpif *dpif,
+                     const struct vlog_module *module,
+                     const struct dpif_flow_put *put,
+                     int error)
+{
+    struct ds s;
+
+    ds_init(&s);
+    ds_put_cstr(&s, "put");
+    if (put->flags & DPIF_FP_CREATE) {
+        ds_put_cstr(&s, "[create]");
+    }
+    if (put->flags & DPIF_FP_MODIFY) {
+        ds_put_cstr(&s, "[modify]");
+    }
+    if (put->flags & DPIF_FP_ZERO_STATS) {
+        ds_put_cstr(&s, "[zero]");
+    }
+
+    log_flow_message1(dpif, error, module, ds_cstr(&s),
+                     put->key, put->key_len, put->mask, put->mask_len,
+                     put->ufid, put->stats, put->actions,
+                     put->actions_len);
+    ds_destroy(&s);
 }
 
 void
@@ -1821,8 +1888,8 @@ log_execute_message(const struct dpif *dpif,
                     const struct dpif_execute *execute,
                     bool subexecute, int error)
 {
-    if (!(error ? VLOG_DROP_WARN(&error_rl) : VLOG_DROP_DBG(&dpmsg_rl))
-        && !execute->probe) {
+    if (!(error ? VLOG_DROP_WARN(&error_rl) : VLOG_DROP_DBG(&dpmsg_rl)
+        && !execute->probe)) {
         struct ds ds = DS_EMPTY_INITIALIZER;
         char *packet;
         uint64_t stub[1024 / 8];

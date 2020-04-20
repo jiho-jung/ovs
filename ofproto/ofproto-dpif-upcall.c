@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <unistd.h>
 
 #include "connmgr.h"
 #include "coverage.h"
@@ -120,6 +121,7 @@ struct revalidator {
  *    - Revalidation threads which read the datapath flow table and maintains
  *      them.
  */
+
 struct udpif {
     struct ovs_list list_node;         /* In all_udpifs list. */
 
@@ -453,6 +455,7 @@ udpif_create(struct dpif_backer *backer, struct dpif *dpif)
     atomic_init(&udpif->n_flows, 0);
     atomic_init(&udpif->n_flows_timestamp, LLONG_MIN);
     ovs_mutex_init(&udpif->n_flows_mutex);
+
     udpif->ukeys = xmalloc(N_UMAPS * sizeof *udpif->ukeys);
     for (int i = 0; i < N_UMAPS; i++) {
         cmap_init(&udpif->ukeys[i].cmap);
@@ -791,6 +794,9 @@ recv_upcalls(struct handler *handler)
 
         ofpbuf_use_stub(recv_buf, recv_stubs[n_upcalls],
                         sizeof recv_stubs[n_upcalls]);
+        // JIHO call dpif_netlink_recv()
+        // JIHO call dpif_netlink_recv__()
+        // JIHO call parse_odp_packet()
         if (dpif_recv(udpif->dpif, handler->handler_id, dupcall, recv_buf)) {
             ofpbuf_uninit(recv_buf);
             break;
@@ -1062,7 +1068,7 @@ classify_upcall(enum dpif_upcall_type type, const struct nlattr *userdata,
  * initialized with at least 128 bytes of space. */
 static void
 compose_slow_path(struct udpif *udpif, struct xlate_out *xout,
-                  odp_port_t odp_in_port, ofp_port_t ofp_in_port,
+                  const struct flow *flow, odp_port_t odp_in_port, ofp_port_t ofp_in_port,
                   struct ofpbuf *buf, uint32_t meter_id,
                   struct uuid *ofproto_uuid)
 {
@@ -1079,7 +1085,9 @@ compose_slow_path(struct udpif *udpif, struct xlate_out *xout,
     port = xout->slow & (SLOW_CFM | SLOW_BFD | SLOW_LACP | SLOW_STP)
         ? ODPP_NONE
         : odp_in_port;
-    pid = dpif_port_get_pid(udpif->dpif, port);
+    // JIHO
+    //pid = dpif_port_get_pid(udpif->dpif, port);
+    pid = dpif_port_get_pid(udpif->dpif, port, flow_hash_5tuple(flow, 0));
 
     size_t offset;
     size_t ac_offset;
@@ -1238,6 +1246,7 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
     } else {
         /* upcall->put_actions already initialized by upcall_receive(). */
         compose_slow_path(udpif, &upcall->xout,
+                          upcall->flow,
                           upcall->flow->in_port.odp_port, upcall->ofp_in_port,
                           &upcall->put_actions,
                           upcall->ofproto->up.slowpath_meter_id,
@@ -2205,7 +2214,7 @@ revalidate_ukey__(struct udpif *udpif, const struct udpif_key *ukey,
             goto exit;
         }
 
-        compose_slow_path(udpif, xoutp, ctx.flow.in_port.odp_port,
+        compose_slow_path(udpif, xoutp, &ctx.flow, ctx.flow.in_port.odp_port,
                           ofp_in_port, odp_actions,
                           ofproto->up.slowpath_meter_id, &ofproto->uuid);
     }

@@ -64,6 +64,10 @@
 #include "unaligned.h"
 #include "util.h"
 
+#include "uuid.h"
+#include "dp-packet.h"
+
+
 VLOG_DEFINE_THIS_MODULE(dpif_netlink);
 #ifdef _WIN32
 #include "wmi.h"
@@ -178,6 +182,8 @@ struct dpif_windows_vport_sock {
 #endif
 
 struct dpif_handler {
+    // JIHO
+    struct dpif_channel *channels; /* Array of channels for each port. */
     struct epoll_event *epoll_events;
     int epoll_fd;                 /* epoll fd that includes channel socks. */
     int n_events;                 /* Num events returned by epoll_wait(). */
@@ -201,7 +207,8 @@ struct dpif_netlink {
     struct fat_rwlock upcall_lock;
     struct dpif_handler *handlers;
     uint32_t n_handlers;           /* Num of upcall handlers. */
-    struct dpif_channel *channels; /* Array of channels for each port. */
+    // JIHO
+    //struct dpif_channel *channels; /* Array of channels for each port. */
     int uc_array_size;             /* Size of 'handler->channels' and */
                                    /* 'handler->epoll_events'. */
 
@@ -239,7 +246,7 @@ static bool ovs_tunnels_out_of_tree = true;
 static int dpif_netlink_init(void);
 static int open_dpif(const struct dpif_netlink_dp *, struct dpif **);
 static uint32_t dpif_netlink_port_get_pid(const struct dpif *,
-                                          odp_port_t port_no);
+                                          odp_port_t port_no, uint32_t hash);
 static void dpif_netlink_handler_uninit(struct dpif_handler *handler);
 static int dpif_netlink_refresh_channels(struct dpif_netlink *,
                                          uint32_t n_handlers);
@@ -390,6 +397,46 @@ open_dpif(const struct dpif_netlink_dp *dp, struct dpif **dpifp)
     return 0;
 }
 
+#if 1
+// JIHO
+/* Destroys the netlink sockets pointed by the elements in 'socksp'
+ * and frees the 'socksp'.  */
+static void
+vport_del_socksp__(struct nl_sock **socksp, uint32_t n_socks)
+{
+    size_t i;
+
+    for (i = 0; i < n_socks; i++) {
+        nl_sock_destroy(socksp[i]);
+    }
+
+    free(socksp);
+}
+
+/* Creates an array of netlink sockets.  Returns an array of the
+ * corresponding pointers.  Records the error in 'error'. */
+static struct nl_sock **
+vport_create_socksp__(uint32_t n_socks, int *error)
+{
+    struct nl_sock **socksp = xzalloc(n_socks * sizeof *socksp);
+    size_t i;
+
+    for (i = 0; i < n_socks; i++) {
+        *error = nl_sock_create(NETLINK_GENERIC, &socksp[i]);
+        if (*error) {
+            goto error;
+        }
+    }
+
+    return socksp;
+
+error:
+    vport_del_socksp__(socksp, n_socks);
+
+    return NULL;
+}
+#endif
+
 #ifdef _WIN32
 static void
 vport_delete_sock_pool(struct dpif_handler *handler)
@@ -446,6 +493,231 @@ error:
 }
 #endif /* _WIN32 */
 
+// JIHO
+static struct nl_sock **
+vport_create_socksp(struct dpif_netlink *dpif, int *error)
+{
+#ifdef _WIN32
+    return vport_create_socksp_windows(dpif, error);
+#else
+    return vport_create_socksp__(dpif->n_handlers, error);
+#endif
+}
+
+static void
+vport_del_socksp(struct dpif_netlink *dpif, struct nl_sock **socksp)
+{
+#ifdef _WIN32
+    vport_del_socksp_windows(dpif, socksp);
+#else
+    vport_del_socksp__(socksp, dpif->n_handlers);
+#endif
+}
+
+
+/* Given the array of pointers to netlink sockets 'socksp', returns
+ * the array of corresponding pids. If the 'socksp' is NULL, returns
+ * a single-element array of value 0. */
+static uint32_t *
+vport_socksp_to_pids(struct nl_sock **socksp, uint32_t n_socks)
+{
+    uint32_t *pids;
+
+    if (!socksp) {
+        pids = xzalloc(sizeof *pids);
+    } else {
+        size_t i;
+
+        pids = xzalloc(n_socks * sizeof *pids);
+        for (i = 0; i < n_socks; i++) {
+            pids[i] = nl_sock_pid(socksp[i]);
+        }
+    }
+
+    return pids;
+}
+
+#if 1
+/* Given the port number 'port_idx', extracts the pids of netlink sockets
+ * associated to the port and assigns it to 'upcall_pids'. */
+static bool
+vport_get_pids(struct dpif_netlink *dpif, uint32_t port_idx,
+               uint32_t **upcall_pids)
+{
+    uint32_t *pids;
+    size_t i;
+
+    /* Since the nl_sock can only be assigned in either all
+     * * or none "dpif->handlers" channels, the following check
+     * would suffice. */
+    if (!dpif->handlers[0].channels[port_idx].sock) {
+        return false;
+    }
+    ovs_assert(!WINDOWS || dpif->n_handlers <= 1);
+
+    pids = xzalloc(dpif->n_handlers * sizeof *pids);
+
+    for (i = 0; i < dpif->n_handlers; i++) {
+        pids[i] = nl_sock_pid(dpif->handlers[i].channels[port_idx].sock);
+    }
+
+    *upcall_pids = pids;
+
+    return true;
+}
+
+static int
+vport_add_channels(struct dpif_netlink *dpif, odp_port_t port_no,
+                   struct nl_sock **socksp)
+{
+    struct epoll_event event;
+    uint32_t port_idx = odp_to_u32(port_no);
+    size_t i, j;
+    int error;
+
+    if (dpif->handlers == NULL) {
+        return 0;
+    }
+
+    /* We assume that the datapath densely chooses port numbers, which can
+     * therefore be used as an index into 'channels' and 'epoll_events' of
+     * 'dpif->handler'. */
+    if (port_idx >= dpif->uc_array_size) {
+        uint32_t new_size = port_idx + 1;
+
+        if (new_size > MAX_PORTS) {
+            VLOG_WARN_RL(&error_rl, "%s: datapath port %"PRIu32" too big",
+                         dpif_name(&dpif->dpif), port_no);
+            return EFBIG;
+        }
+
+        for (i = 0; i < dpif->n_handlers; i++) {
+            struct dpif_handler *handler = &dpif->handlers[i];
+
+            handler->channels = xrealloc(handler->channels,
+                                         new_size * sizeof *handler->channels);
+
+            for (j = dpif->uc_array_size; j < new_size; j++) {
+                handler->channels[j].sock = NULL;
+            }
+
+            handler->epoll_events = xrealloc(handler->epoll_events,
+                                             new_size * sizeof *handler->epoll_events);
+        }
+
+        dpif->uc_array_size = new_size;
+    }
+
+    memset(&event, 0, sizeof event);
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    event.data.u32 = port_idx;
+
+    for (i = 0; i < dpif->n_handlers; i++) {
+        struct dpif_handler *handler = &dpif->handlers[i];
+
+#ifndef _WIN32
+        if (epoll_ctl(handler->epoll_fd, EPOLL_CTL_ADD, nl_sock_fd(socksp[i]),
+                      &event) < 0) {
+            error = errno;
+            goto error;
+        }
+#endif
+        dpif->handlers[i].channels[port_idx].sock = socksp[i];
+        dpif->handlers[i].channels[port_idx].last_poll = LLONG_MIN;
+    }
+
+    return 0;
+
+error:
+    for (j = 0; j < i; j++) {
+#ifndef _WIN32
+        epoll_ctl(dpif->handlers[j].epoll_fd, EPOLL_CTL_DEL,
+                  nl_sock_fd(socksp[j]), NULL);
+#endif
+        dpif->handlers[j].channels[port_idx].sock = NULL;
+    }
+
+    return error;
+}
+
+static void
+vport_del_channels(struct dpif_netlink *dpif, odp_port_t port_no)
+{
+    uint32_t port_idx = odp_to_u32(port_no);
+    size_t i;
+
+    if (!dpif->handlers || port_idx >= dpif->uc_array_size) {
+        return;
+    }
+
+    /* Since the sock can only be assigned in either all or none
+     * of "dpif->handlers" channels, the following check would
+     * suffice. */
+    if (!dpif->handlers[0].channels[port_idx].sock) {
+        return;
+    }
+
+    for (i = 0; i < dpif->n_handlers; i++) {
+        struct dpif_handler *handler = &dpif->handlers[i];
+#ifndef _WIN32
+        epoll_ctl(handler->epoll_fd, EPOLL_CTL_DEL,
+                  nl_sock_fd(handler->channels[port_idx].sock), NULL);
+        nl_sock_destroy(handler->channels[port_idx].sock);
+#endif
+        handler->channels[port_idx].sock = NULL;
+        handler->event_offset = handler->n_events = 0;
+    }
+}
+
+static void
+destroy_all_channels(struct dpif_netlink *dpif)
+    OVS_REQ_WRLOCK(dpif->upcall_lock)
+{
+    unsigned int i;
+
+    if (!dpif->handlers) {
+        return;
+    }
+
+    for (i = 0; i < dpif->uc_array_size; i++ ) {
+        struct dpif_netlink_vport vport_request;
+        uint32_t upcall_pids = 0;
+
+        /* Since the sock can only be assigned in either all or none
+         * of "dpif->handlers" channels, the following check would
+         * suffice. */
+        if (!dpif->handlers[0].channels[i].sock) {
+            continue;
+        }
+
+        /* Turn off upcalls. */
+        dpif_netlink_vport_init(&vport_request);
+        vport_request.cmd = OVS_VPORT_CMD_SET;
+        vport_request.dp_ifindex = dpif->dp_ifindex;
+        vport_request.port_no = u32_to_odp(i);
+        vport_request.n_upcall_pids = 1;
+        vport_request.upcall_pids = &upcall_pids;
+        dpif_netlink_vport_transact(&vport_request, NULL, NULL);
+
+        vport_del_channels(dpif, u32_to_odp(i));
+    }
+
+    for (i = 0; i < dpif->n_handlers; i++) {
+        struct dpif_handler *handler = &dpif->handlers[i];
+
+        dpif_netlink_handler_uninit(handler);
+        free(handler->epoll_events);
+        free(handler->channels);
+    }
+
+    free(dpif->handlers);
+    dpif->handlers = NULL;
+    dpif->n_handlers = 0;
+    dpif->uc_array_size = 0;
+}
+
+
+#else
 /* Given the port number 'port_idx', extracts the pid of netlink socket
  * associated to the port and assigns it to 'upcall_pid'. */
 static bool
@@ -523,6 +795,7 @@ vport_add_channel(struct dpif_netlink *dpif, odp_port_t port_no,
         }
 #endif
     }
+
     dpif->channels[port_idx].sock = sock;
     dpif->channels[port_idx].last_poll = LLONG_MIN;
 
@@ -608,6 +881,7 @@ destroy_all_channels(struct dpif_netlink *dpif)
     dpif->n_handlers = 0;
     dpif->uc_array_size = 0;
 }
+#endif
 
 static void
 dpif_netlink_close(struct dpif *dpif_)
@@ -783,6 +1057,82 @@ netdev_to_ovs_vport_type(const char *type)
     }
 }
 
+#if 1
+static int
+dpif_netlink_port_add__(struct dpif_netlink *dpif, const char *name,
+                        enum ovs_vport_type type,
+                        struct ofpbuf *options,
+                        odp_port_t *port_nop)
+    OVS_REQ_WRLOCK(dpif->upcall_lock)
+{
+    struct dpif_netlink_vport request, reply;
+    struct ofpbuf *buf;
+    struct nl_sock **socksp = NULL;
+    uint32_t *upcall_pids;
+    int error = 0;
+
+    if (dpif->handlers) {
+        socksp = vport_create_socksp(dpif, &error);
+        if (!socksp) {
+            return error;
+        }
+    }
+
+    dpif_netlink_vport_init(&request);
+    request.cmd = OVS_VPORT_CMD_NEW;
+    request.dp_ifindex = dpif->dp_ifindex;
+    request.type = type;
+    request.name = name;
+
+    request.port_no = *port_nop;
+    upcall_pids = vport_socksp_to_pids(socksp, dpif->n_handlers);
+    request.n_upcall_pids = socksp ? dpif->n_handlers : 1;
+    request.upcall_pids = upcall_pids;
+
+    if (options) {
+        request.options = options->data;
+        request.options_len = options->size;
+    }
+
+    error = dpif_netlink_vport_transact(&request, &reply, &buf);
+    if (!error) {
+        *port_nop = reply.port_no;
+    } else {
+        if (error == EBUSY && *port_nop != ODPP_NONE) {
+            VLOG_INFO("%s: requested port %"PRIu32" is in use",
+                      dpif_name(&dpif->dpif), *port_nop);
+        }
+
+        vport_del_socksp(dpif, socksp);
+        goto exit;
+    }
+
+    if (socksp) {
+        error = vport_add_channels(dpif, *port_nop, socksp);
+        if (error) {
+            VLOG_INFO("%s: could not add channel for port %s",
+                      dpif_name(&dpif->dpif), name);
+
+            /* Delete the port. */
+            dpif_netlink_vport_init(&request);
+            request.cmd = OVS_VPORT_CMD_DEL;
+            request.dp_ifindex = dpif->dp_ifindex;
+            request.port_no = *port_nop;
+            dpif_netlink_vport_transact(&request, NULL, NULL);
+            vport_del_socksp(dpif, socksp);
+            goto exit;
+        }
+    }
+
+    free(socksp);
+exit:
+    ofpbuf_delete(buf);
+    free(upcall_pids);
+
+    return error;
+}
+
+#else
 static int
 dpif_netlink_port_add__(struct dpif_netlink *dpif, const char *name,
                         enum ovs_vport_type type,
@@ -854,6 +1204,7 @@ exit:
 
     return error;
 }
+#endif
 
 static int
 dpif_netlink_port_add_compat(struct dpif_netlink *dpif, struct netdev *netdev,
@@ -1073,6 +1424,47 @@ dpif_netlink_port_query_by_name(const struct dpif *dpif_, const char *devname,
     return dpif_netlink_port_query__(dpif, 0, devname, dpif_port);
 }
 
+#if 1
+static uint32_t
+dpif_netlink_port_get_pid__(const struct dpif_netlink *dpif,
+                            odp_port_t port_no, uint32_t hash)
+    OVS_REQ_RDLOCK(dpif->upcall_lock)
+{
+    uint32_t port_idx = odp_to_u32(port_no);
+    uint32_t pid = 0;
+
+    if (dpif->handlers && dpif->uc_array_size > 0) {
+        /* The ODPP_NONE "reserved" port number uses the "ovs-system"'s
+         * channel, since it is not heavily loaded. */
+        uint32_t idx = port_idx >= dpif->uc_array_size ? 0 : port_idx;
+        struct dpif_handler *h = &dpif->handlers[hash % dpif->n_handlers];
+
+        /* Needs to check in case the socket pointer is changed in between
+         * the holding of upcall_lock.  A known case happens when the main
+         * thread deletes the vport while the handler thread is handling
+         * the upcall from that port. */
+        if (h->channels[idx].sock) {
+            pid = nl_sock_pid(h->channels[idx].sock);
+        }
+    }
+
+    return pid;
+}
+
+static uint32_t
+dpif_netlink_port_get_pid(const struct dpif *dpif_, odp_port_t port_no,
+                          uint32_t hash)
+{
+    const struct dpif_netlink *dpif = dpif_netlink_cast(dpif_);
+    uint32_t ret;
+
+    fat_rwlock_rdlock(&dpif->upcall_lock);
+    ret = dpif_netlink_port_get_pid__(dpif, port_no, hash);
+    fat_rwlock_unlock(&dpif->upcall_lock);
+
+    return ret;
+}
+#else
 static uint32_t
 dpif_netlink_port_get_pid__(const struct dpif_netlink *dpif,
                             odp_port_t port_no)
@@ -1110,6 +1502,8 @@ dpif_netlink_port_get_pid(const struct dpif *dpif_, odp_port_t port_no)
 
     return ret;
 }
+
+#endif
 
 static int
 dpif_netlink_flow_flush(struct dpif *dpif_)
@@ -1867,6 +2261,7 @@ dpif_netlink_operate__(struct dpif_netlink *dpif,
 
         switch (op->type) {
         case DPIF_OP_FLOW_PUT:
+            //VLOG_ERR("### JIHO Put Flow in dpif_netlink_operate__");
             put = &op->flow_put;
             dpif_netlink_init_flow_put(dpif, put, &flow);
             if (put->stats) {
@@ -1887,6 +2282,7 @@ dpif_netlink_operate__(struct dpif_netlink *dpif,
             break;
 
         case DPIF_OP_EXECUTE:
+            //VLOG_ERR("### JIHO Execute in dpif_netlink_operate__");
             /* Can't execute a packet that won't fit in a Netlink attribute. */
             if (OVS_UNLIKELY(nl_attr_oversized(
                                  dp_packet_size(op->execute.packet)))) {
@@ -2310,6 +2706,143 @@ dpif_netlink_handler_uninit(struct dpif_handler *handler)
 }
 #endif
 
+#if 1
+/* Synchronizes 'channels' in 'dpif->handlers'  with the set of vports
+ * currently in 'dpif' in the kernel, by adding a new set of channels for
+ * any kernel vport that lacks one and deleting any channels that have no
+ * backing kernel vports. */
+static int
+dpif_netlink_refresh_channels(struct dpif_netlink *dpif, uint32_t n_handlers)
+    OVS_REQ_WRLOCK(dpif->upcall_lock)
+{
+    unsigned long int *keep_channels;
+    struct dpif_netlink_vport vport;
+    size_t keep_channels_nbits;
+    struct nl_dump dump;
+    uint64_t reply_stub[NL_DUMP_BUFSIZE / 8];
+    struct ofpbuf buf;
+    int retval = 0;
+    size_t i;
+
+    ovs_assert(!WINDOWS || n_handlers <= 1);
+    ovs_assert(!WINDOWS || dpif->n_handlers <= 1);
+
+    if (dpif->n_handlers != n_handlers) {
+        destroy_all_channels(dpif);
+        dpif->handlers = xzalloc(n_handlers * sizeof *dpif->handlers);
+        for (i = 0; i < n_handlers; i++) {
+            int error;
+            struct dpif_handler *handler = &dpif->handlers[i];
+
+            error = dpif_netlink_handler_init(handler);
+            if (error) {
+                size_t j;
+
+                for (j = 0; j < i; j++) {
+                    struct dpif_handler *tmp = &dpif->handlers[j];
+                    dpif_netlink_handler_uninit(tmp);
+                }
+                free(dpif->handlers);
+                dpif->handlers = NULL;
+
+                return error;
+            }
+        }
+        dpif->n_handlers = n_handlers;
+    }
+
+    for (i = 0; i < n_handlers; i++) {
+        struct dpif_handler *handler = &dpif->handlers[i];
+
+        handler->event_offset = handler->n_events = 0;
+    }
+
+    keep_channels_nbits = dpif->uc_array_size;
+    keep_channels = bitmap_allocate(keep_channels_nbits);
+
+    ofpbuf_use_stub(&buf, reply_stub, sizeof reply_stub);
+    dpif_netlink_port_dump_start__(dpif, &dump);
+    while (!dpif_netlink_port_dump_next__(dpif, &dump, &vport, &buf)) {
+        uint32_t port_no = odp_to_u32(vport.port_no);
+        uint32_t *upcall_pids = NULL;
+        int error;
+
+        if (port_no >= dpif->uc_array_size
+            || !vport_get_pids(dpif, port_no, &upcall_pids)) {
+            struct nl_sock **socksp = vport_create_socksp(dpif, &error);
+
+            if (!socksp) {
+                goto error;
+            }
+
+            error = vport_add_channels(dpif, vport.port_no, socksp);
+            if (error) {
+                VLOG_INFO("%s: could not add channels for port %s",
+                          dpif_name(&dpif->dpif), vport.name);
+                vport_del_socksp(dpif, socksp);
+                retval = error;
+                goto error;
+            }
+            upcall_pids = vport_socksp_to_pids(socksp, dpif->n_handlers);
+            free(socksp);
+        }
+
+        /* Configure the vport to deliver misses to 'sock'. */
+        if (vport.upcall_pids[0] == 0
+            || vport.n_upcall_pids != dpif->n_handlers
+            || memcmp(upcall_pids, vport.upcall_pids, n_handlers * sizeof
+                      *upcall_pids)) {
+            struct dpif_netlink_vport vport_request;
+
+            dpif_netlink_vport_init(&vport_request);
+            vport_request.cmd = OVS_VPORT_CMD_SET;
+            vport_request.dp_ifindex = dpif->dp_ifindex;
+            vport_request.port_no = vport.port_no;
+            vport_request.n_upcall_pids = dpif->n_handlers;
+            vport_request.upcall_pids = upcall_pids;
+            error = dpif_netlink_vport_transact(&vport_request, NULL, NULL);
+            if (error) {
+                VLOG_WARN_RL(&error_rl,
+                             "%s: failed to set upcall pid on port: %s",
+                             dpif_name(&dpif->dpif), ovs_strerror(error));
+
+                if (error != ENODEV && error != ENOENT) {
+                    retval = error;
+                } else {
+                    /* The vport isn't really there, even though the dump says
+                     * it is.  Probably we just hit a race after a port
+                     * disappeared. */
+                }
+                goto error;
+            }
+        }
+
+        if (port_no < keep_channels_nbits) {
+            bitmap_set1(keep_channels, port_no);
+        }
+        free(upcall_pids);
+        continue;
+
+    error:
+        free(upcall_pids);
+        vport_del_channels(dpif, vport.port_no);
+    }
+    nl_dump_done(&dump);
+    ofpbuf_uninit(&buf);
+
+    /* Discard any saved channels that we didn't reuse. */
+    for (i = 0; i < keep_channels_nbits; i++) {
+        if (!bitmap_is_set(keep_channels, i)) {
+            vport_del_channels(dpif, u32_to_odp(i));
+        }
+    }
+    free(keep_channels);
+
+    return retval;
+}
+
+
+#else
 /* Synchronizes 'channels' in 'dpif->handlers'  with the set of vports
  * currently in 'dpif' in the kernel, by adding a new set of channels for
  * any kernel vport that lacks one and deleting any channels that have no
@@ -2440,6 +2973,7 @@ dpif_netlink_refresh_channels(struct dpif_netlink *dpif, uint32_t n_handlers)
 
     return retval;
 }
+#endif
 
 static int
 dpif_netlink_recv_set__(struct dpif_netlink *dpif, bool enable)
@@ -2582,6 +3116,23 @@ parse_odp_packet(struct ofpbuf *buf, struct dpif_upcall *upcall,
 
     *dp_ifindex = ovs_header->dp_ifindex;
 
+#if 0
+    if (1) {
+        ovs_be16 id = 0;
+        const char *data = dp_packet_data(&upcall->packet);
+        //struct ip_header *ip = dp_packet_l3(&upcall->packet);
+        struct ip_header *ip = (struct ip_header*)(data + sizeof(struct eth_header));
+        if (ip) {
+            id = ntohs(ip->ip_id);
+        }
+
+        VLOG_ERR("### JIHO key: IPID=%u, dpif=%d, ufid:%08x-%04x-%04x-%04x-%04x%08x", 
+                 id,
+                 *dp_ifindex,
+                 UUID_ARGS(((struct uuid *)&upcall->ufid)));
+    }
+#endif
+
     return 0;
 }
 
@@ -2685,7 +3236,12 @@ dpif_netlink_recv__(struct dpif_netlink *dpif, uint32_t handler_id,
 
     while (handler->event_offset < handler->n_events) {
         int idx = handler->epoll_events[handler->event_offset].data.u32;
+        // JIHO
+#if 1
+        struct dpif_channel *ch = &dpif->handlers[handler_id].channels[idx];
+#else
         struct dpif_channel *ch = &dpif->channels[idx];
+#endif
 
         handler->event_offset++;
 
@@ -2782,6 +3338,27 @@ dpif_netlink_recv_wait(struct dpif *dpif_, uint32_t handler_id)
     fat_rwlock_unlock(&dpif->upcall_lock);
 }
 
+#if 1
+static void
+dpif_netlink_recv_purge__(struct dpif_netlink *dpif)
+    OVS_REQ_WRLOCK(dpif->upcall_lock)
+{
+    if (dpif->handlers) {
+        size_t i,j;
+
+        for (i = 0; i < dpif->uc_array_size; i++ ) {
+            if (!dpif->handlers[0].channels[i].sock) {
+                continue;
+            }
+
+            for (j = 0; j < dpif->n_handlers; j++) {
+                nl_sock_drain(dpif->handlers[j].channels[i].sock);
+            }
+        }
+    }
+}
+
+#else
 static void
 dpif_netlink_recv_purge__(struct dpif_netlink *dpif)
     OVS_REQ_WRLOCK(dpif->upcall_lock)
@@ -2798,6 +3375,7 @@ dpif_netlink_recv_purge__(struct dpif_netlink *dpif)
         }
     }
 }
+#endif
 
 static void
 dpif_netlink_recv_purge(struct dpif *dpif_)
